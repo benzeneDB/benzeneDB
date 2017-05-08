@@ -1,171 +1,363 @@
 package benzene
 
 import (
+	"errors"
 	"math/rand"
+	"sync/atomic"
+	"time"
+	"unsafe"
 	"sync"
 )
 
-const (
-	lKey       = 0
-	lVal       = 0
-	nNext      = 0
-	tMaxHeight = 4
-	branching  = 4
-)
+const tMaxHeight = 12
 
-// 具体每个skip list node里面的数据，应该需要加一个encode和decode的方法来对具体存储做解析
-// TODO add encode and decode method
-type MutiKV struct {
-	keyMap       map[[]byte]int
-	valueContent [][]string
+type mNode struct {
+	timeKey int64
+	value   map[string]float64
+	next    []unsafe.Pointer
 }
 
-type ZskipListNode struct {
-	// TODO timeKey need to consider more to ensure a struct to storage, maybe []byte
-	timeKey       int64
-	data          MutiKV
-	nextNode      ZskipListNode
-	nextLevelNode ZskipListNode
-	level         int
+func newNode(timeKey int64, value map[string]float64, height int32) *mNode {
+	return &mNode{timeKey, value, make([]unsafe.Pointer, height)}
 }
 
-type MemDB struct {
-	// 这里是内存结构的主要部分
-	// the lock used to get and put
-	mu sync.RWMutex
-	// TODO need to add a comparer method
-	//cmp comparer.BasicComparer
-
-	// implement a skip list, the node in the skip list is a point to a list, the data in the list is map[byte] []byte. the kvData is the skip list, it is a linked list.
-	// all the data are save in this array, through the nodeData to note every K-V information, such as K is 5 byte, v is 6 byte ...
-	headNode ZskipListNode
-
-	// 加一个专门的timeKey的dict 用来快速查找
-	timeDict map[int64]int
-	maxHight int
-	rnd      *rand.Rand
+func (p *mNode) getNext(n int) *mNode {
+	return (*mNode)(atomic.LoadPointer(&p.next[n]))
 }
 
-func (m *MutiKV) decode() {
-
+func (p *mNode) setNext(n int, x *mNode) {
+	atomic.StorePointer(&p.next[n], unsafe.Pointer(x))
 }
 
-func (m *MutiKV) encode() {
-
+func (p *mNode) getNext_NB(n int) *mNode {
+	return (*mNode)(p.next[n])
 }
 
-func (p *MemDB) randHeight() (h int) {
-	h = 1
-	for h < tMaxHeight && p.rnd.Int()%branching == 0 {
-		h++
+func (p *mNode) setNext_NB(n int, x *mNode) {
+	p.next[n] = unsafe.Pointer(x)
+}
+
+// DB represent an in-memory key/value database.
+type DB struct {
+	rnd       *rand.Rand
+	mu        sync.RWMutex
+	head      *mNode
+	maxHeight int32
+	kvSize    int64
+	n         int32
+	prev      [tMaxHeight]*mNode
+}
+
+// New create new initalized in-memory key/value database.
+func NewDB() *DB {
+	return &DB{
+		rnd:       rand.New(rand.NewSource(0xdeadbeef)),
+		maxHeight: 1,
+		head:      newNode(time.Now().Unix(), make(map[string]float64), tMaxHeight),
 	}
-	return h
 }
 
-func (p *MemDB) IsHasTimeKey(timeStamp int64) {
-	_, ok := p.timeDict[timeStamp]
-	return ok
-}
-
-func (p *MemDB) findTimeKey(timeStamp int64) (ZskipListNode, []ZskipListNode, bool) {
-	node := p.headNode
-	pre := node
-	preList := make([]ZskipListNode, tMaxHeight)
-	// 从最顶层的level开始找
-	for {
-		if node == nil {
-			return pre, preList, false
-		}
-		if node.timeKey == timeStamp {
-			// 找到node
-			return node, preList, true
-		} else if node.timeKey < timeStamp {
-			// 继续向后找
-			pre = node
-			node = node.nextNode
-		} else {
-			// level往下一层
-			preList = append(preList, node)
-			pre = node
-			node = node.nextLevelNode.nextNode
-		}
-	}
-	return node, preList, false
-}
-
-func (p *MemDB) Get(timeKey int64, key byte, value byte) ([]string, bool) {
+func (p *DB) Put(timeKey int64, key string, value float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	timeNode, _, ok := p.findTimeKey(timeKey)
+	if m, exact := p.findGE_NB(timeKey, true); exact {
+		//h := int32(len(m.next))
+		m.value[key] = value
+		//x := newNode(key, value, h)
+		//for i, n := range p.prev[:h] {
+		//	m.setNext_NB(i, m.getNext_NB(i))
+		//	n.setNext(i, m)
+		//}
+		p.kvSize += int64(len(key)) + int64(value)
+		//atomic.AddInt64(&p.kvSize, int64(len(key))+int64(value))
+		return
+	}
+
+	h := p.randHeight()
+	if h > p.maxHeight {
+		for i := p.maxHeight; i < h; i++ {
+			p.prev[i] = p.head
+		}
+		p.maxHeight = h
+		//atomic.StoreInt32(&p.maxHeight, h)
+	}
+	v := make(map[string]float64)
+	v[key] = value
+	x := newNode(timeKey, v, h)
+	for i, n := range p.prev[:h] {
+		x.setNext_NB(i, n.getNext_NB(i))
+		n.setNext(i, x)
+	}
+
+	p.kvSize += int64(len(key)) + int64(value)
+	p.n += 1
+	//atomic.AddInt64(&p.kvSize, int64(len(key))+int64(value))
+	//atomic.AddInt32(&p.n, 1)
+}
+
+func (p *DB) Remove(key int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	x, exact := p.findGE_NB(key, true)
+	if !exact {
+		return
+	}
+
+	h := len(x.next)
+	for i, n := range p.prev[:h] {
+		n.setNext(i, n.getNext_NB(i).getNext_NB(i))
+	}
+
+	// TODO
+	//p.kvSize -=
+	//atomic.AddInt64(&p.kvSize, -int64(x.timeKey + len(x.value)))
+	//atomic.AddInt32(&p.n, -1)
+}
+
+func (p *DB) Contains(timeKey int64) bool {
+	_, exact := p.findGE(timeKey, false)
+	return exact
+}
+
+func (p *DB) Get(timeKey int64, key string) (float64, error) {
+	if x, exact := p.findGE(timeKey, false); exact {
+		value, ok := x.value[key]
+		if ok {
+			return value, nil
+		}
+		//return x.value, nil
+	}
+	return -1.0, errors.New("")
+}
+
+func (p *DB) GetRange(startTime int64, endTime int64, key string) ([]int64, []float64, error) {
+	//var res []float64
+	resKey, resValue, ok := p.findRange(startTime, endTime, key)
 	if ok {
-		if timeNode {
-			keyIndex, ok := timeNode.data.keyMap[key]
-			if ok {
-				return timeNode.data.valueContent[keyIndex], true
+		return resKey, resValue, nil
+	}
+	return resKey, resValue, nil
+}
+
+func (p *DB) Find(key int64) (int64, map[string]float64, error) {
+	if x, _ := p.findGE(key, false); x != nil {
+		return x.timeKey, x.value, nil
+	}
+	return -1, nil, errors.New("")
+}
+
+// NewIterator create a new iterator over the database content.
+func (p *DB) NewIterator() *Iterator {
+	return &Iterator{p: p}
+}
+
+// Size return sum of key/value size.
+func (p *DB) Size() int {
+	return int(atomic.LoadInt64(&p.kvSize))
+}
+
+// Len return the number of entries in the database.
+func (p *DB) Len() int {
+	return int(atomic.LoadInt32(&p.n))
+}
+
+// Must hold RW-lock if prev == true, as it use shared prevNode slice.
+func (p *DB) findGE(key int64, prev bool) (*mNode, bool) {
+	x := p.head
+	h := int(atomic.LoadInt32(&p.maxHeight)) - 1
+	for {
+		next := x.getNext(h)
+		var cmp int64
+		cmp = 1
+		if next != nil {
+			cmp = key - next.timeKey
+		}
+		if cmp < 0 {
+			// Keep searching in this list
+			x = next
+		} else {
+			if prev {
+				p.prev[h] = x
+			} else if cmp == 0 {
+				return next, true
 			}
+			if h == 0 {
+				return next, cmp == 0
+			}
+			h--
 		}
 	}
 	return nil, false
 }
 
-func (p *MemDB) Put(timeStamp int64, key byte, value byte) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	node, preNodeList, ok := p.findTimeKey(timeStamp)
-	if !ok {
-		p.timeDict[timeStamp] = 1
-		// 这次节点的跳表level
-		h := p.randHeight() - 1
-		// 最底下的那个node
-		newNode := &ZskipListNode{
-			timeKey: timeStamp,
-			data:    &MutiKV{},
-			level:   tMaxHeight,
+// Must hold RW-lock if prev == true, as it use shared prevNode slice.
+func (p *DB) findRange(startKey int64, endKey int64, key string) ([]int64, []float64, bool) {
+	x := p.head
+	h := 0
+	var resValue []float64
+	var resKey [] int64
+	for {
+		next := x.getNext(h)
+		if next == nil {
+			return resKey, resValue, true
+		} else {
+			if startKey > next.timeKey {
+				return resKey, resValue, true
+			} else if endKey < next.timeKey {
+				x = next
+			} else if startKey <= next.timeKey && next.timeKey <= endKey {
+				// Keep searching in this list
+				resValue = append(resValue, next.value[key])
+				resKey = append(resKey, next.timeKey)
+				x = next
+			}
 		}
-
-		// 给最底层添加
-		tmpNode := node.nextNode
-		node.nextNode = newNode
-		newNode.nextNode = tmpNode
-
-		// 第h level的节点
-		newHNode := &ZskipListNode{
-			timeKey: timeStamp,
-			// 这里第h层的data和最底层的data是同一个 理论上是一个指针指过去，但是不确定golang
-			// 的指针用法有什么坑，需要再细看下确定下
-			// TODO consider more about the pointer of Golang
-			data:  *newNode.data,
-			level: h,
-		}
-
-		// 给第h level添加
-		tmpHNode := preNodeList[h].nextNode
-		preNodeList[h].nextNode = newHNode
-		newHNode.nextNode = tmpHNode
-		return true
 	}
-
-	return false
+	return resKey, resValue, false
 }
 
-func (p *MemDB) GetRange(start_pos int64, end_pos int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
+
+// Must hold RW-lock if prev == true, as it use shared prevNode slice.
+func (p *DB) findGE_NB(key int64, prev bool) (*mNode, bool) {
+	x := p.head
+	h := int(p.maxHeight) - 1
+	for {
+		next := x.getNext_NB(h)
+		var cmp int64
+		cmp = 1
+		if next != nil {
+			cmp = key - next.timeKey
+		}
+		if cmp < 0 {
+			// Keep searching in this list
+			x = next
+		} else {
+			if prev {
+				p.prev[h] = x
+			} else if cmp == 0 {
+				return next, true
+			}
+			if h == 0 {
+				return next, cmp == 0
+			}
+			h--
+		}
+	}
+	return nil, false
 }
 
-func (p *MemDB) NewDB() MemDB {
+func (p *DB) findLT(timeKey int64) *mNode {
+	x := p.head
+	h := int(atomic.LoadInt32(&p.maxHeight)) - 1
+	for {
+		next := x.getNext(h)
+		if next == nil || (timeKey - next.timeKey) >= 0 {
+			if h == 0 {
+				if x == p.head {
+					return nil
+				}
+				return x
+			}
+			h--
+		} else {
+			x = next
+		}
+	}
+	return nil
+}
 
-	topSkipListNode := &ZskipListNode{
-		timeKey: 0,
-		data:    MutiKV{},
-		level:   tMaxHeight,
+func (p *DB) findLast() *mNode {
+	x := p.head
+	h := int(atomic.LoadInt32(&p.maxHeight)) - 1
+	for {
+		next := x.getNext(h)
+		if next == nil {
+			if h == 0 {
+				if x == p.head {
+					return nil
+				}
+				return x
+			}
+			h--
+		} else {
+			x = next
+		}
 	}
-	memDB := &MemDB{
-		rnd:      rand.New(rand.NewSource(0xdeadbeef)),
-		headNode: topSkipListNode,
-		timeDict: make(map[int64]int),
-		maxHight: tMaxHeight,
+	return nil
+}
+
+func (p *DB) randHeight() (h int32) {
+	const branching = 4
+	h = 1
+	for h < tMaxHeight && p.rnd.Int() % branching == 0 {
+		h++
 	}
-	return memDB
+	return
+}
+
+type Iterator struct {
+	p      *DB
+	node   *mNode
+	onLast bool
+}
+
+func (i *Iterator) Valid() bool {
+	return i.node != nil
+}
+
+func (i *Iterator) First() bool {
+	i.node = i.p.head.getNext(0)
+	return i.Valid()
+}
+
+func (i *Iterator) Last() bool {
+	i.node = i.p.findLast()
+	return i.Valid()
+}
+
+func (i *Iterator) Seek(key int64) (r bool) {
+	i.node, _ = i.p.findGE(key, false)
+	return i.Valid()
+}
+
+func (i *Iterator) Next() bool {
+	if i.node == nil {
+		return i.First()
+	}
+	i.node = i.node.getNext(0)
+	res := i.Valid()
+	if !res {
+		i.onLast = true
+	}
+	return res
+}
+
+func (i *Iterator) Prev() bool {
+	if i.node == nil {
+		if i.onLast {
+			return i.Last()
+		}
+		return false
+	}
+	i.node = i.p.findLT(i.node.timeKey)
+	return i.Valid()
+}
+
+func (i *Iterator) Key() int64 {
+	if !i.Valid() {
+		return -1
+	}
+	return i.node.timeKey
+}
+
+func (i *Iterator) Value() map[string]float64 {
+	if !i.Valid() {
+		return nil
+	}
+	return i.node.value
+}
+
+func (i *Iterator) Error() error {
+	return nil
 }
